@@ -61,8 +61,21 @@ class Engine extends EventEmitter {
     this.emit('log', `[${ts}] ${msg}`);
   }
 
-  /** 第一步：登录，拿到会话和网络参数。验证码通过 waitCaptcha 回传 */
-  async login({ host, port, user, pass }) {
+  /**
+   * 第一步：登录，拿到会话和网络参数。验证码通过 submitCaptcha 回传。
+   * 入参同时兼容界面字段（gateway/password）与内部字段（host/pass），
+   * 避免两侧命名不一致导致请求头被填成 undefined。
+   */
+  async login(form = {}) {
+    const host = String(form.gateway || form.host || '').trim();
+    const port = Number(form.port) || 443;
+    const user = String(form.user || '').trim();
+    const pass = form.password != null ? String(form.password) : String(form.pass || '');
+
+    if (!host) throw new Error('请填写网关地址');
+    if (!user) throw new Error('请填写账号');
+    if (!pass) throw new Error('请填写密码');
+
     if (this._busy) throw new Error('已有操作在进行中');
     this._busy = true;
     try {
