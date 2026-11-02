@@ -37,22 +37,37 @@ function loadWintun(dllPath) {
   }
   if (!fs.existsSync(dllPath)) throw new Error(`找不到 wintun.dll：${dllPath}`);
   const lib = koffi.load(dllPath);
+  // 注意：koffi 在声明函数签名时就会解析符号，任何一个不存在的导出都会让整段绑定失败，
+  // 所以这里逐个绑定并给出明确的缺失项名称。
+  const bind = (sig) => {
+    try {
+      return lib.func(sig);
+    } catch (err) {
+      const name = sig.split('(')[0].trim().split(/\s+/).pop();
+      throw new Error(`wintun.dll 缺少导出函数 ${name}（${err.message}）`);
+    }
+  };
+
+  // Wintun 的错误码走 Win32 GetLastError，wintun.dll 本身不导出 WintunGetLastError
+  const k32 = koffi.load('kernel32.dll');
+  const bindK32 = (sig) => {
+    try { return k32.func(sig); } catch { return null; }
+  };
 
   return {
-    CreateAdapter: lib.func('void * WintunCreateAdapter(str16 Name, str16 TunnelType, GUID *RequestedGUID)'),
-    OpenAdapter: lib.func('void * WintunOpenAdapter(str16 Name)'),
-    CloseAdapter: lib.func('void WintunCloseAdapter(void *Adapter)'),
-    StartSession: lib.func('void * WintunStartSession(void *Adapter, uint32 Capacity)'),
-    EndSession: lib.func('void WintunEndSession(void *Session)'),
-    GetReadWaitEvent: lib.func('void * WintunGetReadWaitEvent(void *Session)'),
-    ReceivePacket: lib.func('void * WintunReceivePacket(void *Session, _Out_ uint32 *PacketSize)'),
-    ReleaseReceivePacket: lib.func('void WintunReleaseReceivePacket(void *Session, void *Packet)'),
-    AllocateSendPacket: lib.func('void * WintunAllocateSendPacket(void *Session, uint32 PacketSize)'),
-    SendPacket: lib.func('void WintunSendPacket(void *Session, void *Packet)'),
-    GetLastError: lib.func('uint32 WintunGetLastError()'),
+    CreateAdapter: bind('void * WintunCreateAdapter(str16 Name, str16 TunnelType, GUID *RequestedGUID)'),
+    OpenAdapter: bind('void * WintunOpenAdapter(str16 Name)'),
+    CloseAdapter: bind('void WintunCloseAdapter(void *Adapter)'),
+    StartSession: bind('void * WintunStartSession(void *Adapter, uint32 Capacity)'),
+    EndSession: bind('void WintunEndSession(void *Session)'),
+    GetReadWaitEvent: bind('void * WintunGetReadWaitEvent(void *Session)'),
+    ReceivePacket: bind('void * WintunReceivePacket(void *Session, _Out_ uint32 *PacketSize)'),
+    ReleaseReceivePacket: bind('void WintunReleaseReceivePacket(void *Session, void *Packet)'),
+    AllocateSendPacket: bind('void * WintunAllocateSendPacket(void *Session, uint32 PacketSize)'),
+    SendPacket: bind('void WintunSendPacket(void *Session, void *Packet)'),
+    GetLastError: bindK32('uint32 GetLastError()') || (() => 0),
     // 必须显式引用 kernel32 的等待函数，否则读循环只能忙等
-    WaitForSingleObject: lib.func('uint32 WaitForSingleObject(void *hHandle, uint32 dwMilliseconds)'),
-    GetLastErrorWin32: lib.func('uint32 GetLastError()'),
+    WaitForSingleObject: bindK32('uint32 WaitForSingleObject(void *hHandle, uint32 dwMilliseconds)') || null,
   };
 }
 
@@ -104,9 +119,11 @@ class TunDevice extends EventEmitter {
 
     while (this.running && this.session) {
       try {
-        if (this.waitEvent) {
+        if (this.waitEvent && WaitForSingleObject) {
           const w = WaitForSingleObject(this.waitEvent, 0);
           if (w !== 0) { await sleep(1); continue; }
+        } else {
+          await sleep(1);
         }
         for (;;) {
           sizeHolder[0] = 0;
