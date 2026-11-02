@@ -107,10 +107,6 @@ function defaultGateway() {
   return inDefault ? null : null;
 }
 
-function macToIpList(mask) {
-  return mask;
-}
-
 class NetConfig {
   constructor(alias) {
     this.alias = alias;

@@ -87,7 +87,6 @@ class Engine extends EventEmitter {
       this.session = normalizeLogin(raw);
       this.session.gateway = host;
       this.session.port = Number(port);
-      this.session.password = pass;
 
       if (!this.session.sessionId) throw new Error('网关未返回 session_id');
       this.log(`登录成功：${this.session.userName || user}，虚拟 IP ${this.session.vip}`);
