@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'" />
+<title>TopSAP 客户端</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">TS</div>
+      <div>
+        <h1>TopSAP 客户端</h1>
+        <p class="sub" id="appVersion">v0.1.0</p>
+      </div>
+    </div>
+    <div class="status-wrap">
+      <span class="dot" id="statusDot"></span>
+      <span id="statusText">未连接</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="card" id="loginCard">
+      <div class="card-head">
+        <h2>网关登录</h2>
+        <span class="hint" id="elevHint"></span>
+      </div>
+
+      <div class="grid2">
+        <label>
+          <span>网关地址</span>
+          <input id="gateway" placeholder="vpn.example.com" autocomplete="off" />
+        </label>
+        <label>
+          <span>端口</span>
+          <input id="port" type="number" value="443" />
+        </label>
+        <label>
+          <span>账号</span>
+          <input id="user" autocomplete="off" />
+        </label>
+        <label>
+          <span>密码</span>
+          <input id="password" type="password" autocomplete="off" />
+        </label>
+      </div>
+
+      <label class="check">
+        <input type="checkbox" id="remember" />
+        <span>记住密码（使用系统密钥加密保存）</span>
+      </label>
+
+      <div class="actions">
+        <button id="btnConnect" class="primary">连接</button>
+        <button id="btnDisconnect" class="ghost" disabled>断开</button>
+      </div>
+    </section>
+
+    <section class="card hidden" id="captchaCard">
+      <div class="card-head">
+        <h2>输入验证码</h2>
+        <span class="hint">看不清可点图片刷新</span>
+      </div>
+      <div class="captcha-row">
+        <img id="captchaImg" alt="验证码" />
+        <div class="captcha-input">
+          <input id="captchaCode" maxlength="8" placeholder="4 位字符" autocomplete="off" />
+          <button id="btnCaptcha" class="primary small">确定</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card hidden" id="statusCard">
+      <div class="card-head">
+        <h2>连接状态</h2>
+        <span class="hint" id="stateDetail"></span>
+      </div>
+      <div class="stats">
+        <div class="stat"><span>虚拟 IP</span><strong id="stVip">—</strong></div>
+        <div class="stat"><span>路由</span><strong id="stRoutes">—</strong></div>
+        <div class="stat"><span>时长</span><strong id="stTime">00:00:00</strong></div>
+        <div class="stat"><span>上行</span><strong id="stUp">0 B</strong></div>
+        <div class="stat"><span>下行</span><strong id="stDown">0 B</strong></div>
+        <div class="stat"><span>收/发包</span><strong id="stPkts">0 / 0</strong></div>
+      </div>
+    </section>
+
+    <section class="card log-card">
+      <div class="card-head">
+        <h2>运行日志</h2>
+        <div class="log-actions">
+          <button id="btnClearLog" class="ghost small">清空</button>
+        </div>
+      </div>
+      <pre id="log" class="log"></pre>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,7 +1,9 @@
 node_modules/
+dist/
 session.json
+.code.txt
 code.txt
 captcha*.png
 *.log
 logs/
-dist/
+.DS_Store

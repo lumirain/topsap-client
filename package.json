@@ -2,11 +2,72 @@
   "name": "topsap-client",
   "version": "0.1.0",
   "description": "Open-source replacement client for Topsec NGVONE SSL VPN",
-  "main": "src/client.js",
-  "scripts": {
-    "start": "node src/client.js"
-  },
-  "keywords": ["vpn", "ssl-vpn", "ngvone", "topsec", "reverse-engineering"],
+  "main": "src/main/main.js",
+  "author": "topsap-client contributors",
   "license": "MIT",
-  "engines": { "node": ">=18" }
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis",
+    "pack": "electron-builder --win --dir"
+  },
+  "keywords": [
+    "vpn",
+    "ssl-vpn",
+    "ngvone",
+    "topsec",
+    "wintun"
+  ],
+  "dependencies": {
+    "koffi": "^3.3.6"
+  },
+  "devDependencies": {
+    "electron": "^33.2.3",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "dev.topsap.client",
+    "productName": "TopSAP Client",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "src/**/*",
+      "package.json",
+      "!**/*.map"
+    ],
+    "extraResources": [
+      {
+        "from": "assets/wintun/wintun.dll",
+        "to": "wintun.dll"
+      }
+    ],
+    "asarUnpack": [
+      "node_modules/koffi/**",
+      "node_modules/@koromix/**"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "requestedExecutionLevel": "requireAdministrator",
+      "artifactName": "${productName}-${version}-setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": true,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "TopSAP 客户端",
+      "deleteAppDataOnUninstall": false
+    }
+  }
 }

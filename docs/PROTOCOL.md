@@ -1,201 +1,208 @@
-# TopSAP (NGVONE) 接入协议说明
+# TopSAP / 天融信 NGVONE 协议说明
 
-本文档由黑盒抓包 + 静态分析 + 真机验证得出，全部结论均经过实测。
-适用于天融信 NGVONE 系列 SSL VPN 网关（`vpn_version: ngvone`）。
+本文件记录的是**实测确认**的行为，不是推测。凡是标注"推断"的地方都单独说明了依据。
 
----
-
-## 1. 总体流程
-
-```
-客户端                                    网关
-  │  POST /vone/login/auth_param           │  获取网关能力（无需认证）
-  │ ──────────────────────────────────────▶│
-  │  GET  /vone/login/gid                  │  取图形验证码（种 cgid Cookie）
-  │ ──────────────────────────────────────▶│
-  │  POST /vone/login/user_pswd            │  提交凭据，返回会话 + 网络参数
-  │ ──────────────────────────────────────▶│
-  │  TLS connect :4431                     │  另建长连接作为隧道
-  │ ──────────────────────────────────────▶│
-  │  登录帧（含 session_id）                  │
-  │ ──────────────────────────────────────▶│
-  │                          ◀──────────────│  确认帧
-  │  通知帧                                  │
-  │ ──────────────────────────────────────▶│
-  │  IPv4 数据帧 ⇄ IPv4 数据帧               │  隧道内直接承载原始 IP 包
-```
-
-认证用短连接，隧道用另一条长连接。两者同一端口（默认 4431）。
+目标固件：TopSAP 客户端 3.6.4.16.64.1（天融信 NGVONE，`vpn_version=ngvone`、`cipher_type=0` 的网关）。
 
 ---
 
-## 2. HTTP 接口
+## 1. 传输层前提
 
-### 2.1 网关能力：`POST /vone/login/auth_param`
+网关的 HTTPS 使用自签或已过期证书，官方客户端**不校验证书链**，且**不发送 SNI**。
+因此本客户端连接时使用 `rejectUnauthorized: false` 并省略 `servername`。
 
-无需认证，返回网关全部配置。响应是宽松 JS 对象（键名不带引号），需容错解析。
+> 安全性说明：这一层没有身份认证能力。在有中间人的网络里，任何人都能冒充网关。
+> 这是原始实现的设计，本客户端为保持兼容而沿用，但在 README 中明确提示。
+
+---
+
+## 2. 登录接口
+
+公共请求头：
+
+```
+User-Agent: VONE-AUTH,WINDOWS,NULL,TOPCLINET,NULL
+```
+
+### 2.1 能力探测
+
+```
+POST /vone/login/auth_param
+```
+
+无需认证。返回网关配置（伪 JSON，键名不带引号）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `auth_port` / `data_port` | 认证端口 / 数据端口 |
+| `vpn_version` | `ngvone`（标准）或 `sm2plusvone`（国密） |
+| `cipher_type` | `0` 表示未启用国密信道加密 |
+| `captcha` | 是否需要图形验证码 |
+
+### 2.2 取验证码
+
+```
+GET /vone/login/gid
+```
+
+返回 PNG，同时 `Set-Cookie: cgid=...`。后续登录必须带上该 cookie，验证码与 `cgid` 绑定。
+
+### 2.3 提交登录
+
+```
+POST /vone/login/user_pswd
+Content-Type: application/x-www-form-urlencoded
+Cookie: cgid=...; topsecsvuilanguage=chinese
+
+U=<账号>&P=<密码>&Gid=<验证码>&HASH=<64位十六进制>&S_CODE=<16字节随机数的Base64>
+```
+
+实测结论：
+
+- **`U` 和 `P` 都是明文。** 前端 `sv_init.js` 里的 RSA + Base64 在 `ngvone` 路径下会被原生层解开，最终发出的是明文。对本网关而言那套加密只是混淆。
+- **`HASH` 的内容不被校验。** 传 64 个 `0` 也能通过。可以推断该字段只在某些加固配置下参与校验，标准网关不检查。
+- `S_CODE` 传任意 16 字节随机数的 Base64 即可。
+- 参数中的 `+` 必须转义为 `%2B`，否则网关按 URL 解码会把 `+` 变成空格（官方客户端自己也踩过这个坑，报 `Ret=-7`）。
+
+常见返回码：
+
+| Ret | 含义 |
+| --- | --- |
+| `0` | 成功 |
+| `-7` | 请求格式错误（多为 `+` 未转义） |
+| `-40018` | 验证码错误 |
+| `-40077` | 账号已在别处登录（单点） |
+| `-40081` | 账号或密码错误 |
+
+### 2.4 登录响应
+
+响应是伪 JSON（键名无引号），包含 9 个顶层节点：
+
+```
+user_param  会话与账号属性
+net_param   网络参数（虚拟 IP、掩码、DNS、隧道类型）
+route_list  需要注入的路由前缀
+acl_list    网关侧访问控制规则
+dns_info    内网主机名映射
+res_list    门户资源列表
+sec_rule    终端合规规则
+ErrMsg, Ret 结果
+```
 
 关键字段：
 
-| 字段 | 含义 |
-|---|---|
-| `vpn_version` | `ngvone` / `sm2plusvone` 等，决定协议分支 |
-| `cipher_type` | `0` = 标准加密（TLS 承载明文 IP 包）；`1` 及以上走国密 |
-| `auth_port` / `data_port` | 认证与数据端口 |
-| `auth_protocol` / `data_protocol` | `0` = TCP |
-| `cert_type` | 证书类型 |
-| `ca_list` | 网关 CA 名称 |
-| `gid` | 验证码策略：`off` / `on` / `auto`（失败若干次后要求） |
-| `oauth2_switch` / `appid` / `agentid` | 企业微信扫码登录配置 |
-
-### 2.2 图形验证码：`GET /vone/login/gid`
-
-- 返回 `image/png`，同时 `Set-Cookie: cgid=<base64 16 字节>`
-- 验证码需人工识别，有效期很短（约 30 秒），且与 `cgid` 绑定
-
-### 2.3 登录：`POST /vone/login/user_pswd`
-
 ```
-Content-Type: application/x-www-form-urlencoded
-User-Agent: VONE-AUTH,WINDOWS,NULL,TOPCLINET,NULL
-Cookie: topsecsvuilanguage=chinese; sv_un=<user>; login_err_num=0;
-        topsecsvportalstyle=style1; topsecsvportalname=default; cgid=<cgid>;
-
-U=<user>&P=<password>&Gid=<captcha>&HASH=<64 hex>&S_CODE=<base64 16B>
+user_param.topafasfasfassession_id   会话 ID，形如 "470&bb70a290c038640"
+user_param.spa_key                   SPA 单包授权密钥
+net_param.vip_v4 / vip_mask          分配给本机的虚拟 IP 与掩码
+net_param.dns1_v4 / dns2_v4          内网 DNS
+net_param.tunnel_type                0=分流，1=全网
+route_list[] {dest, mask}            需要走隧道的网段
+dns_info.dns_list                    形如 "10.22.1.137 http://luban.example.com:3000"
+acl_list[] {protocol, sport, dport, d_ip_v4, d_mask, action, week, start_tm, end_tm}
 ```
 
-要点：
+### 2.5 注销
 
-- **`U` 与 `P` 都是明文**（仅做 URL 编码）。客户端前端那套 `Base64` / `JSEncrypt(RSA)`
-  在 `vpn_version: ngvone` 下**不会出现在报文里**——原生层会用内置私钥解掉 RSA。
-- **`HASH` 服务端不校验内容**，但字段必须存在且为 64 位十六进制。
-  实测传全 `0` 也能正常返回完整配置。
-- **`S_CODE`** 为 16 字节随机数的 Base64，同样只需存在。
-- 缺 `HASH` / `S_CODE` 时服务端会返回一个**残缺会话**：`Ret:0` 有 `session_id`，
-  但响应里没有 `user_param` / `net_param`，隧道会转而索取配置（见 §4）。
-
-成功响应（节选）：
-
-```javascript
-{
-  user_param: {
-    topafasfasfassession_id: "742&d5bab619aaaa90e",
-    username: "temp999",
-    alg: "standard",            // 加密算法族
-    sm_priority: "SM4",         // 国密优先算法
-    spa_key: "2BA465A3...",     // fwknop 单包授权密钥（网关下发）
-    netacc: "on",               // 是否启用网络接入
-    vpn_version: "ngvone"
-  },
-  net_param: {
-    vip_v4: "172.21.9.160",     // 分配给本机的虚拟 IP
-    vip_mask: "255.255.248.0",
-    dns1_v4: "10.22.50.5",
-    dns2_v4: "10.22.50.6",
-    acl_permit: 1,
-    acl_check_switch: 1
-  },
-  Ret: 0
-}
+```
+POST /vone/login/logout
+Cookie: topafasfasfassession_id=<会话ID>
 ```
 
-### 2.4 注销：`POST /vone/login/logout`
-
-带 `Cookie: topafasfasfassession_id=<sid>`，返回 `{Ret:0}`。
-网关默认限制**单账号单会话**，重复登录返回 `Ret:-40077 不允许多点登录`。
+返回 `{ Ret: 0 }`。不注销会占用账号的单点登录名额，下一次登录报 `-40077`。
 
 ---
 
-## 3. 隧道帧格式
+## 3. 隧道协议
 
-TLS 建立后先发一个 HTTP 风格的前导（沿用旧版本兼容）：
+登录走 HTTPS 短连接；隧道是**另开一条 TLS 长连接**到同一端口，之上承载自定义二进制帧。
 
-```
-CONNECT 127.0.0.1:4430 HTTP/1.1
-host:127.0.0.1
-User-Agent: VONE-NA,WINDOWS,NULL,TOPCLINET,NULL
-Proxy-Connection: Keep-Alive
-```
-
-随后进入二进制分帧。**每帧固定 16 字节头 + 载荷**：
+### 3.1 握手
 
 ```
-偏移    长度   含义
-0x00    8    报文类型（大端）
-0x08    4    载荷长度（大端）
-0x0C    4    方向：1 = 客户端 → 网关，0 = 网关 → 客户端
+TCP/TLS 连接 gateway:port
+→ "CONNECT 127.0.0.1:4430 HTTP/1.1\r\nhost:127.0.0.1\r\n
+   User-Agent: VONE-NA,WINDOWS,NULL,TOPCLINET,NULL\r\n
+   Proxy-Connection: Keep-Alive\r\n\r\n"
+→ 登录帧（见下）
+← 确认帧 type=2
+→ 通知帧 type=7，载荷 8 字节零
+↔ 数据帧 type=15
 ```
 
-### 3.1 报文类型
-
-| 类型 | 名称 | 载荷 |
-|---|---|---|
-| 1 | 登录 | 328 字节定长结构，偏移 `0x48` 处放 `session_id` 字符串 |
-| 2 | 确认 | 空 |
-| 7 | 通知 | 8 字节全 0 |
-| 15 | IPv4 数据 | 完整 IPv4 报文（含 IP 头） |
-
-### 3.2 登录帧结构（328 字节载荷）
+登录帧载荷 328 字节，布局：
 
 ```
-+0x00  00 00 00 04        客户端类型（Windows = 4）
-+0x04  00 ...             保留，全 0
-+0x48  "742&d5bab6..."    会话 ID，ASCII，以 0 结尾
-+...   全 0
+偏移 0   4 字节   常量 0x00000004
+偏移 4   68 字节  全零
+偏移 72  19 字节  会话 ID（ASCII，例如 "470&bb70a290c038640"）
+其余      补零
 ```
 
-### 3.3 握手时序
+### 3.2 帧格式
+
+固定 16 字节头 + 载荷，全部大端：
 
 ```
-客户端                                   网关
-  │  帧(type=1, 登录帧)                     │
-  │ ──────────────────────────────────────▶│
-  │                       ◀─────────────────│  帧(type=2, 空载荷)
-  │  帧(type=7, 8 字节 0)                    │
-  │ ──────────────────────────────────────▶│
-  │  帧(type=15, IPv4 包)                    │
-  │ ──────────────────────────────────────▶│
-  │                       ◀─────────────────│  帧(type=15, IPv4 包)
++0..3    保留，恒为 0
++4..7    消息类型   1=登录  2=确认  7=通知  15=IPv4 数据
++8..11   载荷长度
++12..15  方向       1=上行（客户端→网关）  0=下行
 ```
 
-实测一次完整的 DNS 往返：
+`type=15` 的载荷就是一个**完整的 IPv4 报文**（从版本/IHL 开始，含 IP 头）。
+数据面**没有任何额外加密**：`cipher_type=0` 的网关上，国密 SM4 信道不会被启用。
 
-```
--> type=15  IPv4 172.21.9.160 -> 10.22.50.5  UDP 46341 -> 53   (查询 www.sunline.cn)
-<- type=15  IPv4 10.22.50.5 -> 172.21.9.160  UDP 53 -> 46855  (应答，76 字节)
-```
+### 3.3 保活与断线
 
-隧道内承载的就是**原始 IPv4 报文**，没有额外加密（`cipher_type=0` 时）。
-国密模式下由 `cipher_type` 与 `sm_priority` 决定是否叠加 SM4，本网关为 0。
+- 网关侧空闲超时由 `net_param.no_flow_timeout` 控制，`0` 表示不主动断开。
+- 未观察到独立的心跳帧；周期性流量（TCP keepalive 或应用层流量）即可维持。
+- 连接断开后需重新握手，会话 ID 可复用（同一会话内重连无需重新登录）。
 
 ---
 
-## 4. 残缺会话与 `req_packet`
+## 4. 客户端网络模型
 
-若登录响应缺少 `net_param`（例如未带 `HASH` / `S_CODE`），隧道会在确认帧后下发：
+### 4.1 地址
 
-```json
-{ "req_packet": 45, "session_id": "..." }
-```
+虚拟网卡使用 `net_param.vip_v4` / `vip_mask`。MTU 取 1400（官方客户端行为）。
 
-该报文用于向网关索取网络参数，载荷结构尚未解析。
-正常登录（带齐字段）不会走到这条分支，因此**优先保证登录报文完整**。
+### 4.2 路由
+
+官方客户端把 `acl_list` 逐条展开成 /32 路由（实测 22 条 ACL → 28 条路由）。
+`route_list` 提供的是等价的网段聚合，本客户端直接使用它，代价是路由表更干净（5 条而非 28 条）。
+
+**必须**为网关自身的 IP 加一条旁路路由（走物理默认网关），否则隧道连接会自己走进隧道形成环路。
+
+### 4.3 DNS
+
+- 内网主机名走 `dns_info.dns_list`，本质是 hosts 覆盖。本客户端写成 hosts 的独立段落，断开时整段移除。
+- 网卡 DNS 设为 `dns1_v4`，让内网域名解析走隧道。不劫持全局 DNS，避免影响正常上网。
+
+### 4.4 分流
+
+`tunnel_type=0` 为分流：只把 `route_list` 里的网段打进隧道，其余流量走物理网络。
+网关侧另有 `acl_list` 做二次管控，即使本地路由放通，未授权的目标也会被丢弃。
 
 ---
 
-## 5. 客户端侧要做的事
+## 5. 与官方实现的差异
 
-1. 用 `net_param` 配置虚拟网卡：IP = `vip_v4`，掩码 = `vip_mask`，DNS = `dns1_v4`/`dns2_v4`
-2. 从网卡读出 IP 包 → 加 16 字节头（type=15, dir=1）→ 写入 TLS
-3. 从 TLS 读帧 → type=15 时剥掉 16 字节头 → 写入网卡
-4. 保活：定时发送 type=7 通知帧
-5. 断线：`POST /vone/login/logout` 并复位网卡
+| 方面 | 官方客户端 | 本客户端 |
+| --- | --- | --- |
+| 虚拟网卡 | NDIS 小端口驱动 `TopvDev.sys`（`\\.\TOPVNIC`，重叠 I/O） | Wintun（微软签名驱动，用户态 DLL） |
+| 路由来源 | 展开 ACL 成 /32 | 直接用 `route_list` 网段 |
+| 进程模型 | Electron 界面 + `sv_service.exe`(LocalSystem) + `na_client.exe`，共享内存传 socket 句柄 | 单进程，全部逻辑在应用内 |
+| 登录字段 | 前端 RSA/Base64 后由原生层解密 | 直接发明文（网关要的就是明文） |
+| 证书校验 | 不校验证书链、不发 SNI | 相同（兼容性要求） |
+| 国密 | 支持 SM2/SM4（`sm2plusvone` 网关） | 未实现，仅支持 `ngvone` |
 
 ---
 
-## 6. 已验证的边界
+## 6. 未实现 / 已知限制
 
-- 网关不校验证书有效期（实测真实证书已过期仍可连接），也不校验 SNI。
-- 网关不校验 `HASH` 内容，仅校验字段存在。
-- 口令在应用层为明文，机密性完全依赖 TLS。
-- 单账号单会话，重登需先注销。
+1. **国密网关（`sm2plusvone`）不支持。** 只验证过 `vpn_version=ngvone`。
+2. **SPA 单包授权未实现。** 登录响应会下发 `spa_key`，标准网关上不启用；若网关开启 SPA，需要先发 fwknop 敲门包。
+3. **`acl_list` 只用于展示统计，未做本地过滤。** 实际管控由网关执行。
+4. **UDP over TCP 的封装细节未知。** 实测隧道直接承载原始 IP 报文，未观察到额外封装头；若某类网关启用了封装，需要重新抓包确认。
+5. **断线重连**为重新握手，不做会话恢复。
