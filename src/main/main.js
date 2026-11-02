@@ -111,7 +111,23 @@ function wireEngine() {
   engine.on('error', (e) => send('engine:error', e.message));
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  // 自检模式：不开窗口，验证虚拟网卡数据面后退出
+  const stArg = process.argv.find((a) => a.startsWith('--selftest='));
+  if (stArg) {
+    const out = stArg.split('=').slice(1).join('=');
+    const lines = [];
+    const log = (m) => { lines.push(m); console.log(m); };
+    try {
+      await require('./selftest').run(log);
+    } catch (err) {
+      log('自检异常：' + err.message);
+    }
+    try { fs.writeFileSync(out, lines.join('\r\n'), 'utf8'); } catch { /* 忽略 */ }
+    app.exit(0);
+    return;
+  }
+
   wireEngine();
   createWindow();
 
@@ -188,4 +204,18 @@ ipcMain.handle('dialog:openLog', async () => {
   const p = path.join(app.getPath('userData'), 'client.log');
   if (fs.existsSync(p)) shell.openPath(p);
   return p;
+});
+
+ipcMain.handle('app:selftest', async () => {
+  const lines = [];
+  let ok = false;
+  try {
+    ok = await require('./selftest').run((m) => {
+      lines.push(m);
+      send('engine:log', m);
+    });
+  } catch (err) {
+    lines.push('自检异常：' + err.message);
+  }
+  return { ok, lines };
 });

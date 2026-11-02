@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld('api', {
   connect: () => ipcRenderer.invoke('conn:connect'),
   disconnect: () => ipcRenderer.invoke('conn:disconnect'),
   openLog: () => ipcRenderer.invoke('dialog:openLog'),
+  selftest: () => ipcRenderer.invoke('app:selftest'),
   on: (channel, cb) => {
     const allowed = ['engine:state', 'engine:log', 'engine:captcha', 'engine:stats', 'engine:error'];
     if (!allowed.includes(channel)) return () => {};

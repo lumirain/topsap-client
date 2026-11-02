@@ -140,6 +140,17 @@ el.captchaCode.addEventListener('keydown', (e) => {
 
 el.btnClearLog.addEventListener('click', () => { el.log.textContent = ''; });
 
+$('btnSelftest').addEventListener('click', async () => {
+  const btn = $('btnSelftest');
+  btn.disabled = true;
+  btn.textContent = '自检中…';
+  appendLog('开始网卡自检：临时创建虚拟网卡并用回环 ICMP 验证收发');
+  const r = await window.api.selftest();
+  btn.disabled = false;
+  btn.textContent = '网卡自检';
+  appendLog(r.ok ? '网卡自检通过：数据面收发正常' : '网卡自检未全部通过，详见上方输出');
+});
+
 // ---------- 主进程事件 ----------
 
 window.api.on('engine:state', (s) => {
