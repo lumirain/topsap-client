@@ -1,31 +1,34 @@
 'use strict';
 /**
- * 网卡自检 v2
+ * 网卡自检
  *
- * 目的：在没有真实网关的情况下，判断虚拟网卡的收发是否正常。
+ * 目的：在没有真实网关的情况下，判断这块虚拟网卡能不能真正承载 VPN 流量。
  *
- * 分三层验证，从「一定成立」到「依赖系统路由」逐层推进：
- *   A. 写路径：直接构造一个 ICMP 请求写进网卡（WintunAllocateSendPacket + SendPacket）
- *   B. 读路径：上一步的包被 Windows 收到后应当回一个应答，应答会重新交给网卡，
- *              读循环若收到它，说明两个方向都通
- *   C. 系统路由：ping 同网段地址，验证 Windows 是否真的把包路由进了这块网卡
+ * 两项关键验证：
+ *   A. 写路径：应用把 IP 包写进网卡（WintunAllocateSendPacket/SendPacket）
+ *   B. 跨网段投递：让系统 ping 一个「不在网卡所在子网、但路由指向网卡」的地址。
+ *      这正是真实 VPN 的形态（虚拟 IP 是 172.21.x.x，内网网段是 10.22.x.x），
+ *      系统会把包直接交给网卡而不做 ARP 解析。读循环如果看到了这个包，
+ *      说明真实场景下的下行通路是通的；我们再把回显应答写回去，ping 通即为闭环。
  *
- * C 失败但 A/B 通过时，说明网卡本身没问题，是系统侧路由/邻居解析的差异。
+ * 注意：不要用「ping 同网段地址」来测。同网段会触发 ARP，而对端不存在，
+ * 必然超时，且不能说明任何问题。
  *
- * 只能在管理员权限下运行，所以由主程序（清单为 requireAdministrator）拉起。
+ * 只能在管理员权限下运行，由主程序（清单为 requireAdministrator）拉起。
  */
 const { execFile } = require('child_process');
 const { TunDevice, resolveDll, ADAPTER_NAME } = require('../engine/tun');
-const { NetConfig, isElevated, interfaceIpv4 } = require('../engine/netcfg');
+const { NetConfig, isElevated, interfaceIpv4, decodeOutput } = require('../engine/netcfg');
 
 const TEST_VIP = '10.99.99.2';
 const TEST_MASK = '255.255.255.0';
-const TEST_PEER = '10.99.99.3';
+const TEST_REMOTE = '10.98.0.5';        // 刻意放在另一个网段
+const TEST_ROUTE = { dest: '10.98.0.0', mask: '255.255.0.0' };
 
-function exec(cmd, args, timeout = 8000) {
+function exec(cmd, args, timeout = 10000) {
   return new Promise((resolve) => {
-    execFile(cmd, args, { windowsHide: true, timeout }, (err, stdout, stderr) => {
-      resolve({ ok: !err, out: (stdout || '') + (stderr || '') });
+    execFile(cmd, args, { windowsHide: true, timeout, encoding: null }, (err, stdout, stderr) => {
+      resolve({ ok: !err, out: decodeOutput(stdout) + decodeOutput(stderr) });
     });
   });
 }
@@ -47,7 +50,6 @@ function buildIcmpEcho({ src, dst, type = 8, id = 0x1234, seq = 1, payloadLen = 
   for (let i = 0; i < payloadLen; i++) payload[i] = i;
   const icmp = Buffer.alloc(8 + payloadLen);
   icmp[0] = type;
-  icmp[1] = 0;
   icmp.writeUInt16BE(id, 4);
   icmp.writeUInt16BE(seq, 6);
   payload.copy(icmp, 8);
@@ -65,10 +67,26 @@ function buildIcmpEcho({ src, dst, type = 8, id = 0x1234, seq = 1, payloadLen = 
   return Buffer.concat([ip, icmp]);
 }
 
+/** 把收到的 ICMP 请求改写成应答（交换源/目的地址） */
+function makeReply(pkt) {
+  const ihl = (pkt[0] & 0x0f) * 4;
+  if (pkt.length < ihl + 8 || pkt[9] !== 1 || pkt[ihl] !== 8) return null;
+  const out = Buffer.from(pkt);
+  out[ihl] = 0;
+  out.writeUInt16BE(0, ihl + 2);
+  out.writeUInt16BE(checksum(out.subarray(ihl)), ihl + 2);
+  pkt.copy(out, 12, 16, 20);
+  pkt.copy(out, 16, 12, 16);
+  out[8] = 64;
+  out.writeUInt16BE(0, 10);
+  out.writeUInt16BE(checksum(out.subarray(0, ihl)), 10);
+  return out;
+}
+
 const ICMP_NAMES = { 0: 'echo-reply', 3: 'unreachable', 8: 'echo-request', 11: 'time-exceeded' };
 
 function describe(pkt) {
-  if (!pkt || pkt.length < 20) return `非 IP 报文（len=${pkt.length}）`;
+  if (!pkt || pkt.length < 20) return `非 IP 报文（${pkt ? pkt.length : 0} 字节）`;
   const version = pkt[0] >> 4;
   if (version === 6) {
     const nh = pkt[6];
@@ -77,15 +95,14 @@ function describe(pkt) {
   }
   if (version !== 4) return `未知版本 ${version}（${pkt.length} 字节）`;
 
-  const pair = `${pkt[12]}.${pkt[13]}.${pkt[14]}.${pkt[15]} -> ${pkt[16]}.${pkt[17]}.${pkt[18]}.${pkt[19]}`;
-  const proto = pkt[9];
-  if (proto === 1) {
+  const pair = `${pkt[12]}.${pkt[13]}.${pkt[14]}.${pkt[15]} → ${pkt[16]}.${pkt[17]}.${pkt[18]}.${pkt[19]}`;
+  if (pkt[9] === 1) {
     const ihl = (pkt[0] & 0x0f) * 4;
     return `ICMP ${ICMP_NAMES[pkt[ihl]] || 'type' + pkt[ihl]} ${pair}`;
   }
-  if (proto === 17) return `UDP ${pair} ${pkt.readUInt16BE(20)}->${pkt.readUInt16BE(22)}`;
-  if (proto === 6) return `TCP ${pair} ${pkt.readUInt16BE(20)}->${pkt.readUInt16BE(22)}`;
-  return `${pair} proto=${proto}`;
+  if (pkt[9] === 17) return `UDP ${pair} ${pkt.readUInt16BE(20)}→${pkt.readUInt16BE(22)}`;
+  if (pkt[9] === 6) return `TCP ${pair} ${pkt.readUInt16BE(20)}→${pkt.readUInt16BE(22)}`;
+  return `${pair} proto=${pkt[9]}`;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -112,70 +129,52 @@ async function run(log) {
 
     net = new NetConfig(ADAPTER_NAME);
     await net.configureInterface(TEST_VIP, TEST_MASK);
-    record('配置网卡地址', true, `${TEST_VIP}/${TEST_MASK}`);
-
-    // 配置函数内部已经回读校验，这里用同一套接口再确认一次（netsh 输出受系统语言影响，不可靠）
     const addrList = interfaceIpv4(net.ifIndex);
     const hasIp = addrList.includes(TEST_VIP);
-    record('回读网卡地址', hasIp, hasIp ? `地址已生效（${addrList.join(',')}）` : `地址未生效（当前：${addrList.join(',') || '无'}）`);
-    if (!hasIp) log(addr.out.trim().split(/\r?\n/).slice(0, 8).join(' / '));
+    record('配置网卡地址', hasIp, hasIp ? `${TEST_VIP}/${TEST_MASK} 已生效` : `当前：${addrList.join(',') || '无'}`);
 
-    // 静态邻居条目：让 Windows 不必等待 ARP 就能把包交给网卡
-    const nb = await exec('netsh', ['interface', 'ipv4', 'add', 'neighbors', `"${ADAPTER_NAME}"`, TEST_PEER, '02-00-00-00-00-01']);
-    log('邻居条目：' + (nb.ok ? '已添加' : '添加失败（可忽略）'));
+    const added = net.addRoutes([TEST_ROUTE]);
+    record('注入测试路由', added === 1, added === 1 ? `${TEST_ROUTE.dest}/${TEST_ROUTE.mask} 已生效` : '路由未生效');
 
-    let sawOut = false;
     let sawValid = false;
+    let sawRequest = false;
     let sawReply = false;
     const seen = [];
 
     tun.readLoop((pkt) => {
-      sawOut = true;
       const ver = pkt.length >= 20 ? (pkt[0] >> 4) : 0;
       if (ver === 4 || ver === 6) sawValid = true;
-      if (seen.length < 5) {
-        seen.push(`${describe(pkt)}（len=${pkt.length} 头=${pkt.subarray(0, 20).toString('hex')}）`);
-      }
-      if (pkt.length > 20 && pkt[9] === 1) {
-        const ihl = (pkt[0] & 0x0f) * 4;
-        if (pkt[ihl] === 0) sawReply = true;
-        // 若系统把请求发了出来，代替对端回一个应答，让 ping 能通
-        if (pkt[ihl] === 8) {
-          tun.write(buildIcmpEcho({
-            src: TEST_VIP, dst: TEST_PEER, type: 0,
-            payloadLen: Math.max(0, pkt.length - ihl - 8),
-          }));
-        }
+      if (seen.length < 4) seen.push(`${describe(pkt)}（${pkt.length} 字节，头 ${pkt.subarray(0, 12).toString('hex')}）`);
+
+      const reply = makeReply(pkt);
+      if (reply) {
+        sawRequest = true;
+        tun.write(reply);
+      } else if (pkt.length >= 20 && pkt[9] === 1 && pkt[(pkt[0] & 0x0f) * 4] === 0) {
+        sawReply = true;
       }
     });
     record('启动读循环', true, '已就绪');
 
-    // A. 写路径：注入一个发给自己的 echo 请求
-    const probePkt = buildIcmpEcho({ src: TEST_PEER, dst: TEST_VIP, type: 8 });
-    const wrote = tun.write(probePkt);
-    record('发送方向（应用 → 网卡）', wrote, wrote ? `已写入 ${probePkt.length} 字节 ICMP 请求` : 'WintunAllocateSendPacket 返回空');
+    // A. 写路径：往网卡里写一个包
+    const probe = buildIcmpEcho({ src: TEST_REMOTE, dst: TEST_VIP, type: 8 });
+    const wrote = tun.write(probe);
+    record('发送方向（应用 → 网卡）', wrote, wrote ? `写入 ${probe.length} 字节` : 'WintunAllocateSendPacket 返回空');
 
-    // B. 读路径：Windows 应当对这个请求回一个应答，应答重新交给网卡
-    for (let i = 0; i < 30 && !sawReply; i++) await sleep(100);
-    const readOk = sawReply || sawValid;
-    record('接收方向（网卡 → 应用）', readOk,
-      sawReply ? '收到 ICMP 回显应答，双向均正常'
-        : (sawValid ? `读通路正常，收到 ${seen[0] || ''}` : (sawOut ? `收到无法解析的报文：${seen[0] || ''}` : '读循环没有收到任何报文')));
-
-    // C. 系统路由：ping 同网段地址，看系统是否把包交给网卡
-    const beforeValid = sawValid;
-    const p = await exec('ping', ['-n', '2', '-w', '1500', TEST_PEER], 12000);
+    // B. 跨网段投递：这是真实 VPN 的形态
+    const p = await exec('ping', ['-n', '2', '-w', '1200', TEST_REMOTE], 15000);
     const pingOk = /TTL=/i.test(p.out);
-    record('系统路由（ping 同网段）', pingOk ? true : (sawValid && !beforeValid ? true : null),
-      pingOk ? 'ping 通' : 'ping 未通');
-    if (!pingOk) {
-      const brief = p.out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(0, 4).join(' / ');
-      log('ping 输出：' + brief.slice(0, 200));
-    }
+    record('系统路由（跨网段投递）', pingOk ? true : (sawRequest ? true : (sawValid ? null : false)),
+      pingOk ? `ping ${TEST_REMOTE} 成功，系统已把包交给网卡且应答回注成功`
+        : (sawRequest ? `已收到发往 ${TEST_REMOTE} 的请求，说明系统确实把包交给了网卡`
+          : '没有看到任何发往该地址的报文'));
 
-    const routeOut = await exec('route', ['print', '-4']);
-    const routes = routeOut.out.split(/\r?\n/).filter((l) => l.includes('10.99.99')).map((l) => l.trim());
-    log('相关路由：' + (routes.length ? routes.slice(0, 3).join(' | ') : '（无 10.99.99 网段路由）'));
+    if (!pingOk) {
+      const brief = p.out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(0, 3).join(' / ');
+      log('ping 输出：' + brief.slice(0, 160));
+    }
+    if (seen.length) log('收到报文：' + seen[0]);
+    if (sawReply) log('（同时收到了 ICMP 回显应答）');
   } catch (err) {
     record('执行异常', false, err.message);
   } finally {

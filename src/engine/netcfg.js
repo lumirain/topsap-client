@@ -16,18 +16,35 @@ const MARK_END = '# <<< topsap-client end <<<';
 
 function run(cmd, args, opts = {}) {
   return execFileSync(cmd, args, {
-    encoding: 'utf8',
+    encoding: null,
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
     ...opts,
   });
 }
 
+/**
+ * Windows 命令行的输出是系统代码页（简体中文为 GBK），
+ * 按 UTF-8 读会变成乱码，所以这里先试 UTF-8，出现替换字符再退回 GBK。
+ */
+function decodeOutput(buf) {
+  if (typeof buf === 'string') return buf;
+  if (!Buffer.isBuffer(buf)) return buf == null ? '' : String(buf);
+  const asUtf8 = buf.toString('utf8');
+  if (!asUtf8.includes('\uFFFD')) return asUtf8;
+  try {
+    return new TextDecoder('gbk').decode(buf);
+  } catch {
+    return asUtf8;
+  }
+}
+
 function tryRun(cmd, args) {
   try {
-    return { ok: true, out: run(cmd, args) };
+    return { ok: true, out: decodeOutput(run(cmd, args)) };
   } catch (err) {
-    return { ok: false, out: (err.stdout || '') + (err.stderr || ''), err };
+    const out = decodeOutput(err.stdout) + decodeOutput(err.stderr);
+    return { ok: false, out, err };
   }
 }
 
@@ -286,5 +303,6 @@ function isElevated() {
 }
 
 module.exports = {
-  NetConfig, isElevated, ifIndexByName, interfaceIpv4, defaultGateway, stripBlock, maskToPrefixLen, HOSTS,
+  NetConfig, isElevated, ifIndexByName, interfaceIpv4, defaultGateway,
+  stripBlock, maskToPrefixLen, decodeOutput, HOSTS,
 };
