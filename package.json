@@ -1,0 +1,12 @@
+{
+  "name": "topsap-client",
+  "version": "0.1.0",
+  "description": "Open-source replacement client for Topsec NGVONE SSL VPN",
+  "main": "src/client.js",
+  "scripts": {
+    "start": "node src/client.js"
+  },
+  "keywords": ["vpn", "ssl-vpn", "ngvone", "topsec", "reverse-engineering"],
+  "license": "MIT",
+  "engines": { "node": ">=18" }
+}

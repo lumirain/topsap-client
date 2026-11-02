@@ -1,0 +1,7 @@
+node_modules/
+session.json
+code.txt
+captcha*.png
+*.log
+logs/
+dist/
