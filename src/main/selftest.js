@@ -68,7 +68,15 @@ function buildIcmpEcho({ src, dst, type = 8, id = 0x1234, seq = 1, payloadLen = 
 const ICMP_NAMES = { 0: 'echo-reply', 3: 'unreachable', 8: 'echo-request', 11: 'time-exceeded' };
 
 function describe(pkt) {
-  if (!pkt || pkt.length < 20) return '非 IP 报文';
+  if (!pkt || pkt.length < 20) return `非 IP 报文（len=${pkt.length}）`;
+  const version = pkt[0] >> 4;
+  if (version === 6) {
+    const nh = pkt[6];
+    const name = nh === 58 ? 'ICMPv6' : (nh === 17 ? 'UDP' : (nh === 6 ? 'TCP' : `next=${nh}`));
+    return `IPv6 ${name}（${pkt.length} 字节）`;
+  }
+  if (version !== 4) return `未知版本 ${version}（${pkt.length} 字节）`;
+
   const pair = `${pkt[12]}.${pkt[13]}.${pkt[14]}.${pkt[15]} -> ${pkt[16]}.${pkt[17]}.${pkt[18]}.${pkt[19]}`;
   const proto = pkt[9];
   if (proto === 1) {
@@ -123,7 +131,8 @@ async function run(log) {
 
     tun.readLoop((pkt) => {
       sawOut = true;
-      if (pkt.length >= 20 && (pkt[0] >> 4) === 4) sawValid = true;
+      const ver = pkt.length >= 20 ? (pkt[0] >> 4) : 0;
+      if (ver === 4 || ver === 6) sawValid = true;
       if (seen.length < 5) {
         seen.push(`${describe(pkt)}（len=${pkt.length} 头=${pkt.subarray(0, 20).toString('hex')}）`);
       }
@@ -150,8 +159,8 @@ async function run(log) {
     for (let i = 0; i < 30 && !sawReply; i++) await sleep(100);
     const readOk = sawReply || sawValid;
     record('接收方向（网卡 → 应用）', readOk,
-      sawReply ? '收到 Windows 的 ICMP 应答，双向均正常'
-        : (sawValid ? `收到报文：${seen[0] || ''}` : (sawOut ? `收到无效报文：${seen[0] || ''}` : '读循环没有收到任何报文')));
+      sawReply ? '收到 ICMP 回显应答，双向均正常'
+        : (sawValid ? `读通路正常，收到 ${seen[0] || ''}` : (sawOut ? `收到无法解析的报文：${seen[0] || ''}` : '读循环没有收到任何报文')));
 
     // C. 系统路由：ping 同网段地址，看系统是否把包交给网卡
     const beforeValid = sawValid;

@@ -156,19 +156,58 @@ class NetConfig {
     if (r.ok) this.injected.push({ kind: 'bypass', dest: gwIp });
   }
 
-  /** 注入内网路由 */
+  /** 读当前活动路由表（排除持久路由段），返回 "dest|mask" 集合 */
+  activeRoutes() {
+    const r = tryRun('route', ['print', '-4']);
+    const set = new Set();
+    if (!r.ok) return set;
+    const lines = r.out.split(/\r?\n/);
+    const cut = lines.findIndex((l) => /Persistent Routes|永久路由/i.test(l));
+    const end = cut > 0 ? cut : lines.length;
+    for (let i = 0; i < end; i++) {
+      const m = lines[i].trim().match(/^(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+\S+\s+\S+\s+\d+/);
+      if (m) set.add(`${m[1]}|${m[2]}`);
+    }
+    return set;
+  }
+
+  hasRoute(dest, mask) {
+    return this.activeRoutes().has(`${dest}|${mask}`);
+  }
+
+  /**
+   * 注入内网路由。
+   * route.exe 在某些网卡上会接受参数但不落地，所以每条都回读校验，
+   * 失败则改用另一套接口再试一次；返回真正生效的条数。
+   */
   addRoutes(routes) {
     if (this.ifIndex === null) throw new Error('接口尚未初始化');
+    const idx = this.ifIndex;
+    let ok = 0;
+
     for (const rt of routes) {
-      const r = tryRun('route', [
-        'ADD', rt.dest, 'MASK', rt.mask, '0.0.0.0',
-        'IF', String(this.ifIndex), 'METRIC', '1',
-      ]);
-      if (r.ok) {
+      if (this.hasRoute(rt.dest, rt.mask)) {
+        this.injected.push({ kind: 'route', dest: rt.dest, mask: rt.mask, preexisting: true });
+        ok += 1;
+        continue;
+      }
+
+      tryRun('route', ['ADD', rt.dest, 'MASK', rt.mask, '0.0.0.0', 'IF', String(idx), 'METRIC', '1']);
+      if (!this.hasRoute(rt.dest, rt.mask)) {
+        const prefix = `${rt.dest}/${maskToPrefixLen(rt.mask)}`;
+        tryRun('powershell', [
+          '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command',
+          `New-NetRoute -DestinationPrefix ${prefix} -InterfaceIndex ${idx} -NextHop 0.0.0.0 `
+          + `-RouteMetric 1 -ErrorAction SilentlyContinue`,
+        ]);
+      }
+
+      if (this.hasRoute(rt.dest, rt.mask)) {
         this.injected.push({ kind: 'route', dest: rt.dest, mask: rt.mask });
+        ok += 1;
       }
     }
-    return this.injected.filter((i) => i.kind === 'route').length;
+    return ok;
   }
 
   /** 把网关下发的 dns_list 写成 hosts 覆盖段 */
@@ -197,7 +236,7 @@ class NetConfig {
   /** 撤销全部改动 */
   cleanup() {
     for (const item of this.injected.slice().reverse()) {
-      if (item.kind === 'route') {
+      if (item.kind === 'route' && !item.preexisting) {
         tryRun('route', ['DELETE', item.dest, 'MASK', item.mask, 'IF', String(this.ifIndex)]);
       } else if (item.kind === 'bypass') {
         tryRun('route', ['DELETE', item.dest, 'MASK', '255.255.255.255']);

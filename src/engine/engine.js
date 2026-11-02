@@ -169,7 +169,13 @@ class Engine extends EventEmitter {
       const n = this.net.addRoutes(s.routes);
       this.net.setDns(s.dns1);
       const h = this.net.applyHosts(s.hosts);
-      this.log(`已注入 ${n} 条路由，写入 ${h} 条 hosts 记录，DNS ${s.dns1}`);
+      this.log(`已注入 ${n}/${s.routes.length} 条路由，写入 ${h} 条 hosts 记录，DNS ${s.dns1}`);
+      if (s.routes.length && n === 0) {
+        throw new Error('路由注入失败，内网流量无法进入隧道');
+      }
+      if (s.routes.length && n < s.routes.length) {
+        this.log(`警告：有 ${s.routes.length - n} 条路由未生效，对应网段可能访问不到`);
+      }
 
       // 双向数据泵
       this.tunnel.on('packet', (pkt) => {
