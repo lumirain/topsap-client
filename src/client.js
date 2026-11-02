@@ -5,10 +5,10 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const HOST = process.env.TS_GW || 'vpn1.sunline.cn';
+const HOST = process.env.TS_GW || '';
 const PORT = parseInt(process.env.TS_PORT || '4431', 10);
-const USER = process.env.TS_USER || 'temp999';
-const PASS = process.env.TS_PASS || 'Sunline2026';
+const USER = process.env.TS_USER || '';
+const PASS = process.env.TS_PASS || '';
 const SESS_FILE = path.join(__dirname, 'session.json');
 const CODEFILE = path.join(__dirname, 'code.txt');
 const UA = 'VONE-AUTH,WINDOWS,NULL,TOPCLINET,NULL';
@@ -156,6 +156,8 @@ function parseIp(buf) {
 }
 
 async function main() {
+  if (!HOST) throw new Error('请设置环境变量 TS_GW（网关地址）');
+  if (!USER || !PASS) throw new Error('请设置环境变量 TS_USER / TS_PASS');
   let s = loadSession();
   if (!s) s = await doLogin();
   else console.log(`[会话] 复用 ${s.sid} VIP=${s.vip}（${Math.round((Date.now() - s.at) / 1000)}s 前）`);
@@ -197,7 +199,7 @@ async function main() {
         // 真实客户端登录后立刻发的 24 字节通知帧：seq=7 len=8 cmd=1 payload 8 个 0
         sock.write(frame(1, Buffer.alloc(8), 7));
         console.log('  -> 发送通知帧 seq=7 len=8');
-        setTimeout(() => { if (probes === 0) { probes = 1; sendProbe('www.sunline.cn'); } }, 1200);
+        setTimeout(() => { if (probes === 0) { probes = 1; sendProbe('www.example.com'); } }, 1200);
       }
     }
   });
@@ -205,7 +207,7 @@ async function main() {
   sock.on('error', (e) => console.log('[隧道] 错误 ' + e.message));
   setTimeout(() => {
     console.log('\n[结束] 未发探针则重试一次');
-    if (probes === 0) { probes = 1; sendProbe('www.baidu.com'); }
+    if (probes === 0) { probes = 1; sendProbe('example.org'); }
     setTimeout(() => process.exit(0), 6000);
   }, 9000);
 }
