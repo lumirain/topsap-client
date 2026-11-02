@@ -33,6 +33,16 @@ function tryRun(cmd, args) {
 
 /** 通过 netsh 取接口索引 */
 function ifIndexByName(alias) {
+  // 优先用 PowerShell 取，输出结构稳定；netsh 的输出会随系统语言变化
+  const ps = tryRun('powershell', [
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command',
+    `(Get-NetAdapter -Name '${alias}' -ErrorAction SilentlyContinue | Select-Object -First 1).ifIndex`,
+  ]);
+  if (ps.ok) {
+    const n = parseInt(String(ps.out).trim(), 10);
+    if (Number.isInteger(n) && n > 0) return n;
+  }
+
   const r = tryRun('netsh', ['interface', 'ipv4', 'show', 'interfaces']);
   if (!r.ok) return null;
   for (const line of r.out.split(/\r?\n/)) {
@@ -41,6 +51,27 @@ function ifIndexByName(alias) {
     if (m) return Number(m[1]);
   }
   return null;
+}
+
+/** 读接口上现有的 IPv4 地址 */
+function interfaceIpv4(ifIndex) {
+  const r = tryRun('powershell', [
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command',
+    `(Get-NetIPAddress -InterfaceIndex ${ifIndex} -AddressFamily IPv4 -ErrorAction SilentlyContinue | `
+    + `Select-Object -ExpandProperty IPAddress) -join ','`,
+  ]);
+  if (!r.ok) return [];
+  return String(r.out).trim().split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+function maskToPrefixLen(mask) {
+  const parts = String(mask).split('.').map(Number);
+  let bits = 0;
+  for (const p of parts) {
+    let n = p;
+    while (n & 0x80) { bits += 1; n = (n << 1) & 0xff; }
+  }
+  return bits;
 }
 
 /** 取默认网关（用于给网关地址本身加一条旁路路由，避免流量绕回隧道） */
@@ -72,14 +103,44 @@ class NetConfig {
     this.dnsSet = false;
   }
 
-  /** 配置网卡地址与 MTU */
-  configureInterface(vip, mask) {
+  /**
+   * 配置网卡地址。
+   * 刚创建出来的虚拟网卡需要一点时间才可配置，且 netsh 在部分系统上会对 Wintun 网卡
+   * 「返回成功但实际没生效」。所以这里最多三轮：每轮先后尝试 netsh 与 PowerShell，
+   * 每轮结束都回读校验，三轮都失败才报错。
+   */
+  async configureInterface(vip, mask) {
     const idx = ifIndexByName(this.alias);
     if (idx === null) throw new Error(`未找到虚拟网卡「${this.alias}」，驱动可能未就绪`);
     this.ifIndex = idx;
 
-    const r = tryRun('netsh', ['interface', 'ipv4', 'set', 'address', `name=${this.alias}`, 'static', vip, mask]);
-    if (!r.ok) throw new Error(`设置虚拟网卡地址失败：${r.out.trim()}`);
+    tryRun('netsh', ['interface', 'set', 'interface', `name=${this.alias}`, 'admin=enable']);
+
+    const prefixLen = maskToPrefixLen(mask);
+    const attempt = [];
+    let actual = [];
+
+    for (let round = 1; round <= 3; round++) {
+      if (round === 1 || round === 3) {
+        const r = tryRun('netsh', ['interface', 'ipv4', 'set', 'address', `name=${this.alias}`, 'static', vip, mask]);
+        attempt.push(`第${round}轮 netsh=${r.ok ? 'ok' : 'fail'}`);
+      } else {
+        const r = tryRun('powershell', [
+          '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command',
+          `Remove-NetIPAddress -InterfaceIndex ${idx} -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue; `
+          + `New-NetIPAddress -InterfaceIndex ${idx} -IPAddress ${vip} -PrefixLength ${prefixLen} -ErrorAction SilentlyContinue`,
+        ]);
+        attempt.push(`第${round}轮 powershell=${r.ok ? 'ok' : 'fail'}`);
+      }
+
+      await new Promise((r) => setTimeout(r, 600));
+      actual = interfaceIpv4(idx);
+      if (actual.includes(vip)) break;
+    }
+
+    if (!actual.includes(vip)) {
+      throw new Error(`设置网卡地址失败（当前：${actual.join(',') || '无'}；${attempt.join('，')}）`);
+    }
 
     tryRun('netsh', ['interface', 'ipv4', 'set', 'subinterface', this.alias, 'mtu=1400', 'store=active']);
     return idx;
@@ -185,4 +246,6 @@ function isElevated() {
   }
 }
 
-module.exports = { NetConfig, isElevated, ifIndexByName, defaultGateway, stripBlock, HOSTS };
+module.exports = {
+  NetConfig, isElevated, ifIndexByName, interfaceIpv4, defaultGateway, stripBlock, maskToPrefixLen, HOSTS,
+};

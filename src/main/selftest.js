@@ -16,7 +16,7 @@
  */
 const { execFile } = require('child_process');
 const { TunDevice, resolveDll, ADAPTER_NAME } = require('../engine/tun');
-const { NetConfig, isElevated } = require('../engine/netcfg');
+const { NetConfig, isElevated, interfaceIpv4 } = require('../engine/netcfg');
 
 const TEST_VIP = '10.99.99.2';
 const TEST_MASK = '255.255.255.0';
@@ -103,15 +103,13 @@ async function run(log) {
     record('创建虚拟网卡与会话', true, ADAPTER_NAME);
 
     net = new NetConfig(ADAPTER_NAME);
-    net.configureInterface(TEST_VIP, TEST_MASK);
+    await net.configureInterface(TEST_VIP, TEST_MASK);
     record('配置网卡地址', true, `${TEST_VIP}/${TEST_MASK}`);
 
-    // DAD（重复地址检测）期间接口不转发，等一下再测
-    await sleep(1500);
-
-    const addr = await exec('netsh', ['interface', 'ipv4', 'show', 'addresses', `name=${ADAPTER_NAME}`]);
-    const hasIp = addr.out.includes(TEST_VIP);
-    record('回读网卡地址', hasIp, hasIp ? '地址已生效' : '地址未生效');
+    // 配置函数内部已经回读校验，这里用同一套接口再确认一次（netsh 输出受系统语言影响，不可靠）
+    const addrList = interfaceIpv4(net.ifIndex);
+    const hasIp = addrList.includes(TEST_VIP);
+    record('回读网卡地址', hasIp, hasIp ? `地址已生效（${addrList.join(',')}）` : `地址未生效（当前：${addrList.join(',') || '无'}）`);
     if (!hasIp) log(addr.out.trim().split(/\r?\n/).slice(0, 8).join(' / '));
 
     // 静态邻居条目：让 Windows 不必等待 ARP 就能把包交给网卡
@@ -119,12 +117,16 @@ async function run(log) {
     log('邻居条目：' + (nb.ok ? '已添加' : '添加失败（可忽略）'));
 
     let sawOut = false;
+    let sawValid = false;
     let sawReply = false;
     const seen = [];
 
     tun.readLoop((pkt) => {
       sawOut = true;
-      if (seen.length < 5) seen.push(describe(pkt));
+      if (pkt.length >= 20 && (pkt[0] >> 4) === 4) sawValid = true;
+      if (seen.length < 5) {
+        seen.push(`${describe(pkt)}（len=${pkt.length} 头=${pkt.subarray(0, 20).toString('hex')}）`);
+      }
       if (pkt.length > 20 && pkt[9] === 1) {
         const ihl = (pkt[0] & 0x0f) * 4;
         if (pkt[ihl] === 0) sawReply = true;
@@ -146,16 +148,16 @@ async function run(log) {
 
     // B. 读路径：Windows 应当对这个请求回一个应答，应答重新交给网卡
     for (let i = 0; i < 30 && !sawReply; i++) await sleep(100);
-    const readOk = sawReply || sawOut;
+    const readOk = sawReply || sawValid;
     record('接收方向（网卡 → 应用）', readOk,
       sawReply ? '收到 Windows 的 ICMP 应答，双向均正常'
-        : (sawOut ? `收到报文：${seen[0] || ''}` : '读循环没有收到任何报文'));
+        : (sawValid ? `收到报文：${seen[0] || ''}` : (sawOut ? `收到无效报文：${seen[0] || ''}` : '读循环没有收到任何报文')));
 
     // C. 系统路由：ping 同网段地址，看系统是否把包交给网卡
-    const before = sawOut;
+    const beforeValid = sawValid;
     const p = await exec('ping', ['-n', '2', '-w', '1500', TEST_PEER], 12000);
     const pingOk = /TTL=/i.test(p.out);
-    record('系统路由（ping 同网段）', pingOk ? true : (sawOut && !before ? true : null),
+    record('系统路由（ping 同网段）', pingOk ? true : (sawValid && !beforeValid ? true : null),
       pingOk ? 'ping 通' : 'ping 未通');
     if (!pingOk) {
       const brief = p.out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(0, 4).join(' / ');

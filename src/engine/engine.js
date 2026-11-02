@@ -135,7 +135,7 @@ class Engine extends EventEmitter {
 
       this.setState(STATE.CONFIG, '正在配置网卡地址');
       this.net = new NetConfig(ADAPTER_NAME);
-      this.net.configureInterface(s.vip, s.vipMask);
+      await this.net.configureInterface(s.vip, s.vipMask);
       this.net.bypassGateway(s.gateway);
       this.log(`网卡地址 ${s.vip} / ${s.vipMask}，MTU 1400`);
 
